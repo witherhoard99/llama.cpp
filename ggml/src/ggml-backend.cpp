@@ -255,6 +255,7 @@ static uint64_t g_cache_hits;
 static uint64_t g_cache_misses;
 static uint64_t g_ram_hits;
 static uint64_t g_disk_misses;
+static uint64_t g_disk_wait_ns;
 static uint64_t g_n1_prefetch_total;
 static uint64_t g_n1_prefetch_hits;
 uint64_t g_access_counter = 0;
@@ -276,10 +277,11 @@ static void ggml_expert_cache_stats_loop() {
         double gpu_rate = total > 0 ? 100.0 * hits / total : 0.0;
         double ram_rate = total > 0 ? 100.0 * ram_hits / total : 0.0;
         double disk_rate = total > 0 ? 100.0 * disk_misses / total : 0.0;
-        fprintf(stdout, "[expert cache] GPU=%llu (%.1f%%) RAM=%llu (%.1f%%) disk=%llu (%.1f%%)\n",
+        fprintf(stdout, "[expert cache] GPU=%llu (%.1f%%) RAM=%llu (%.1f%%) disk=%llu (%.1f%%) disk_wait=%.3fs\n",
             (unsigned long long)hits, gpu_rate,
             (unsigned long long)ram_hits, ram_rate,
-            (unsigned long long)disk_misses, disk_rate);
+            (unsigned long long)disk_misses, disk_rate,
+            (double)g_disk_wait_ns / 1e9);
         uint64_t n1_total = g_n1_prefetch_total;
         uint64_t n1_hits = g_n1_prefetch_hits;
         if (n1_total > 0) {
@@ -2265,6 +2267,7 @@ static void wait_for_reads_finish(ggml_expert_tensor_cache *cache,
                                   struct ggml_tensor *input_cpy,
                                   const std::vector<uint32_t> *active_exp_ids)
 {
+    auto t0 = std::chrono::steady_clock::now();
     size_t expert_size = cache->expert_size;
 
     auto is_active = [&](uint32_t exp_id) -> bool {
@@ -2343,6 +2346,8 @@ static void wait_for_reads_finish(ggml_expert_tensor_cache *cache,
         }
     }
     //ggml_backend_synchronize(split_backend);
+    auto t1 = std::chrono::steady_clock::now();
+    g_disk_wait_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
 }
 
 static void *get_xfer_buf(ggml_expert_tensor_cache *cache)
