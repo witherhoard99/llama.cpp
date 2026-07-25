@@ -4501,10 +4501,15 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();
+        // Retry without ReadOnly (not supported on all devices)
+        err = cudaHostRegister(buffer, size, cudaHostRegisterPortable);
+        if (err != cudaSuccess) {
+            (void)cudaGetLastError();
 
-        GGML_LOG_DEBUG("%s: failed to register %.2f MiB of pinned memory: %s\n", __func__,
+            GGML_LOG_DEBUG("%s: failed to register %.2f MiB of pinned memory: %s\n", __func__,
                            size / 1024.0 / 1024.0, cudaGetErrorString(err));
-        return false;
+            return false;
+        }
     }
     return true;
 #else

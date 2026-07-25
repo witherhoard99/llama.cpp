@@ -1,3 +1,112 @@
+# MoE Expert Caching
+
+**This is a fork with a three-tier expert weight cache for Mixture-of-Experts (MoE) models.**
+It adds a GPU/RAM/disk caching layer that keeps the most-used expert weights in VRAM,
+a larger set in pinned host RAM, and reads the rest on-demand from disk via `O_DIRECT` +
+`io_uring`, bypassing the Linux page cache. This allows running MoE models
+with the same VRAM usage as with the pre-existing `--n-cpu-moe` approach, but
+with higher performance. Or alternatively, the same performance you were already
+getting but with lower VRAM usage.
+
+**Warning**: This is very much proof-of-concept code, but it has worked well
+during testing.
+
+This code is optimized exclusively for generation throughput (t/s); no work has
+been put into optimizing prefill performance. This is why, for example, expert
+usage tracking only runs during generation.
+
+**Linux-only** the current implementation depends on `io_uring`, `madvise`, and `posix_memalign`, which are
+Linux-specific. It has only been tested with an NVIDIA GPU, on a single-GPU system.
+
+**Tested on**: RTX 5080 (PCIe Gen 4), Ryzen 3900X, 32 GB DDR4 RAM, and a decade old SATA SSD (~500 MB/s sequential read max).
+On this hardware the bottleneck for larger models is disk reads on cache misses, a fast
+NVMe SSD would likely allow running much larger models by reducing that bottleneck.
+
+**Not tested with MTP** expert usage tracking only updates during generation
+(by checking if the token count is `1`). During prefill (token count > 1), usage
+counts are skipped to avoid skewing the cache. With multi-token prediction (MTP),
+the token count during generation may exceed `1`, breaking this assumption and
+causing usage tracking to not be updated properly, leading to the wrong experts being populated in the cache.
+If you decide to try with MTP enabled anyway, you will need to make sure the MTP layer is fully GPU resident by using an `-ot` parameter,
+otherwise the layer tracking that the `input_cpy` rewrite code depends on will become off.
+Likewise, the code has only been tested with 1 single request at a time, if multiple requests run and bounce between different
+layers then the `last_layer` static variable will become off and wrong things can probably happen.
+I haven't looked into this.
+
+**Configuration (environment variables):**
+
+| Variable | Default | Description |
+|---|---|---|
+| `GGML_EXPERT_CACHE_MAX` | 110 | Max experts per tensor kept in GPU VRAM |
+| `GGML_EXPERT_RAM_CACHE_MAX` | 300 | Max experts per tensor kept in pinned host RAM |
+| `GGML_OP_OFFLOAD_MIN_BATCH` | - | **Must be set to `1`** for the expert cache to work |
+
+Any remaining experts not in GPU or RAM cache are loaded on demand from disk via `io_uring` + `O_DIRECT`.
+Use `--mmap` (not `--no-mmap`) to avoid keeping all weights in RAM, since the expert cache
+uses `madvise(MADV_DONTNEED)` to release mmap'd pages after pre-populating the RAM cache.
+The code only uses the mmap'd weights as a hacky way to get the offset for a given weight from the file
+to avoid having to parse the GGUF. This is done so that all changes can fit into `ggml-backend.cpp`.
+If running with `GGML_EXPERT_CACHE` but not `GGML_EXPERT_RAM_CACHE`, you should also use `--mmap`
+instead of `--no-mmap`. In this mode all expert weights are stored in RAM (there is no disk tier).
+
+**Example usage:**
+```sh
+GGML_EXPERT_CACHE_MAX=90 GGML_EXPERT_RAM_CACHE_MAX=166 GGML_OP_OFFLOAD_MIN_BATCH=1 ./build/bin/llama-server -fa on -ctk q8_0 -ctv q8_0 -m ~/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf -c 256000 --jinja --mmap -ngl 99 --cpu-moe -t 11 -lv 4
+```
+
+**How it works:**
+
+- **GPU tier**: Hottest experts live in a pre-allocated VRAM buffer. When all active
+  experts are cached, `input_cpy` is remapped to point directly at cache slots (zero-copy).
+  When only some active experts are in GPU cache, cached experts are copied from the GPU
+  cache buffer while uncached ones are fetched from RAM or disk.
+- **RAM tier**: A `cudaHostRegister`'d pinned staging buffer holds additional experts.
+  Transfers to GPU are asynchronous over PCIe. When evicting VRAM experts with
+  `GGML_EXPERT_RAM_CACHE` enabled, evicted expert weights are copied from GPU
+  back into RAM rather than re-read from disk. This was found to be fastest on
+  the test hardware, but with a fast NVMe SSD it may be faster to just re-read
+  from disk. This has not been tested.
+- **Disk tier**: Remaining experts are read on demand from the GGUF file via `io_uring`
+  with `O_DIRECT`. Sibling tensors (gate/up/down) of the same layer are read at the same time to minize wasted time.
+- **Eviction**: The cache eviction strategy is currently "LFU with aging". When the max usage count exceeds 128, all counts are
+  halved to prevent stale entries from locking the cache. This was the best cache
+  approach I found during initial testing, though it could be worth revisiting
+  different caching strategies again.
+- **Next-layer prefetch (disabled)**: There is code to speculatively prefetch the
+  top-used disk-resident experts for upcoming layers (N+1 through N+DEPTH) while
+  the current layer is being processed. However, this only achieved a ~1% hit rate.
+  Expert selection patterns aren't predictable enough across layers to make it
+  worthwhile, atleast not in a naive implementation. The code remains behind the `ENABLE_PREFETCH` compile-time define
+  (set to `0` by default).
+- **Stats**: A background thread prints GPU/RAM/disk hit rates every 10 seconds.
+  On exit, a `llama_expert_usage.txt` file is written with per-layer expert usage details.
+
+# Expert Caching Comparisons
+
+System usage @ idle: VRAM ~400 MiB, RAM 1–2 GB.
+
+`Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` is the unsloth MTP variant, but MTP wasn't used for any of the tests.
+
+| Model | Target | Expert Cache | Experts (VRAM/RAM/Disk) | VRAM | RAM | Speed | Improvement |
+|-------|--------|-------------|--------------------------|------|-----|-------|-------------|
+| **Qwen3.6 35B** (Qwen3.6-35B-A3B-UD-Q4_K_M.gguf) @ 256k max ctx | 32 GB RAM + 16 GB VRAM | Yes | 120/136/0 | 15,253 MiB | 12 GB | ~80 t/s | **+60%** |
+| **Qwen3.6 35B** (Qwen3.6-35B-A3B-UD-Q4_K_M.gguf) @ 256k max ctx | 32 GB RAM + 16 GB VRAM | No | -ncmoe 21 | 15,766 MiB | 12.5 GB | ~50 t/s | — |
+| **Qwen3.6 35B** (Qwen3.6-35B-A3B-UD-Q4_K_M.gguf) @ 256k max ctx | 16 GB RAM + 12 GB VRAM | Yes | 70/186/0 | 11,643 MiB | ~16 GB | ~66 t/s | **+65%** |
+| **Qwen3.6 35B** (Qwen3.6-35B-A3B-UD-Q4_K_M.gguf) @ 256k max ctx | 16 GB RAM + 12 GB VRAM | No | -ncmoe 30 | 11,580 MiB | 16.5 GB | ~40 t/s | — |
+| **Qwen3-Coder-Next** (Qwen3-Coder-Next-UD-IQ4_XS.gguf) @ 256k max ctx | 32 GB RAM + 16 GB VRAM | Yes | 110/402/0 | 14,732 MiB | 28.7 GB | ~50 t/s | **+66%** |
+| **Qwen3-Coder-Next** (Qwen3-Coder-Next-UD-IQ4_XS.gguf) @ 256k max ctx | 32 GB RAM + 16 GB VRAM | No | -ncmoe 37 | 15,091 MiB | 28.4 GB | ~30 t/s | — |
+| **Qwen3-Coder-Next** (Qwen3-Coder-Next-UD-IQ4_XS.gguf) @ 256k max ctx | 32 GB RAM + 12 GB VRAM | Yes | 55/402/55 | 10,988 MiB | 28.7 GB | ~27 t/s | **+58%** |
+| **Qwen3-Coder-Next** (Qwen3-Coder-Next-UD-IQ4_XS.gguf) @ 256k max ctx | 32 GB RAM + 12 GB VRAM | No | -ncmoe 41 | 12,162 MiB | ~2 GB | ~17 t/s | — |
+
+All tests were run with `llama-cli -fa on -ctk q8_0 -ctv q8_0 -m <model.gguf> -c 256000 --jinja --no-mmap -ngl 99 --n-cpu-moe XX -t 11 -n 1000 -f test-prompt.txt --perf --single-turn` for the non expert cache runs.
+And `GGML_EXPERT_CACHE_MAX=XXX GGML_EXPERT_RAM_CACHE_MAX=YYY GGML_OP_OFFLOAD_MIN_BATCH=1 llama-cli -fa on -ctk q8_0 -ctv q8_0 -m <model.gguf> -c 256000 --jinja --mmap -ngl 99 --cpu-moe -t 11 -n 1000 -f test-prompt.txt --perf --single-turn` for the expert cache runs.
+
+`test-prompt.txt` contains: `Create a python script that prints the size in bytes of all the expert weights in a gguf file`.
+
+----
+
+# Original README
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)

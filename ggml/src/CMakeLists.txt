@@ -494,6 +494,7 @@ foreach (target ggml-base ggml)
 endforeach()
 
 target_link_libraries(ggml-base PRIVATE Threads::Threads)
+target_link_libraries(ggml-base PRIVATE uring)
 
 if (DEFINED MATH_LIBRARY)
     target_link_libraries(ggml-base PRIVATE ${MATH_LIBRARY})
