@@ -23,7 +23,12 @@ import type {
 	SettingsSectionEntry,
 	SettingsSection
 } from '$lib/types';
-import { CLI_FLAGS, DEFAULT_MCP_CONFIG } from '$lib/constants';
+import { CLI_FLAGS } from './cli-flags';
+import { DEFAULT_MCP_CONFIG } from './mcp';
+import {
+	FILE_GLOB_SEARCH_PICKERS_MAX_SEARCH_DEPTH,
+	FILE_GLOB_SEARCH_PICKERS_DEFAULT_SEARCH_DEPTH
+} from './working-directory';
 import { SETTINGS_KEYS } from './settings-keys';
 import { ROUTES, SETTINGS_SECTION_SLUGS } from './routes';
 import { TITLE_GENERATION } from './title-generation';
@@ -198,7 +203,7 @@ const SETTINGS_REGISTRY: Record<string, SettingsSectionEntry> = {
 				key: SETTINGS_KEYS.SHOW_MESSAGE_STATS,
 				label: 'Show message generation statistics',
 				help: 'Display generation statistics (tokens/second, token count, duration) below each assistant message.',
-				defaultValue: false,
+				defaultValue: true,
 				type: SettingsFieldType.CHECKBOX,
 				section: SETTINGS_SECTION_SLUGS.DISPLAY
 			},
@@ -295,6 +300,14 @@ const SETTINGS_REGISTRY: Record<string, SettingsSectionEntry> = {
 				key: SETTINGS_KEYS.SHOW_BUILD_VERSION,
 				label: 'Show build version information',
 				help: 'Display the current build version in the bottom-right corner of the interface.',
+				defaultValue: false,
+				type: SettingsFieldType.CHECKBOX,
+				section: SETTINGS_SECTION_SLUGS.DISPLAY
+			},
+			{
+				key: SETTINGS_KEYS.SHOW_FULL_PATH_IN_MENTIONS,
+				label: 'Show full path in mentions',
+				help: 'Display the full file system path inside file and folder @-mention badges instead of just the file or folder name.',
 				defaultValue: false,
 				type: SettingsFieldType.CHECKBOX,
 				section: SETTINGS_SECTION_SLUGS.DISPLAY
@@ -552,6 +565,18 @@ const SETTINGS_REGISTRY: Record<string, SettingsSectionEntry> = {
 				label: 'MCP request timeout (seconds)',
 				help: 'Timeout for individual MCP tool calls.',
 				defaultValue: DEFAULT_MCP_CONFIG.requestTimeoutSeconds,
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.AGENTIC,
+				isPositiveInteger: true
+			},
+			{
+				key: SETTINGS_KEYS.MENTION_SEARCH_MAX_DEPTH,
+				label: 'Mention search depth',
+				help: 'How many directory levels below the working directory the @-mention file search descends. Larger values surface deeply nested files but take longer on large trees.',
+				defaultValue: FILE_GLOB_SEARCH_PICKERS_DEFAULT_SEARCH_DEPTH,
+				placeholder: `${FILE_GLOB_SEARCH_PICKERS_DEFAULT_SEARCH_DEPTH}`,
+				min: 1,
+				max: FILE_GLOB_SEARCH_PICKERS_MAX_SEARCH_DEPTH,
 				type: SettingsFieldType.INPUT,
 				section: SETTINGS_SECTION_SLUGS.AGENTIC,
 				isPositiveInteger: true
